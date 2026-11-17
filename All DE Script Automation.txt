@@ -1,0 +1,86 @@
+<script runat="server">
+Platform.Load("core", "1.1.1");
+
+var TARGET = "B6B1C012-...";   // external key of AllDE
+var BATCH = 500;
+
+var api = new Script.Util.WSProxy();
+var byId = {};
+
+function retrieveAll(type, cols, filter) {
+  var out = [];
+  var res = api.retrieve(type, cols, filter);
+  while (true) {
+    for (var i = 0; i < res.Results.length; i++) out.push(res.Results[i]);
+    if (!res.HasMoreRows) break;
+    res = api.getNextBatch(type, res.RequestID);
+  }
+  return out;
+}
+
+function folderType(t) {
+  return retrieveAll("DataFolder", ["ID", "Name", "ParentFolder.ID"], {
+    Property: "ContentType", SimpleOperator: "equals", Value: t
+  });
+}
+
+function pathOf(id) {
+  var parts = [], guard = 0, cur = id;
+  while (cur && byId[cur] && guard++ < 30) {
+    parts.unshift(byId[cur].Name);
+    cur = byId[cur].ParentFolder ? byId[cur].ParentFolder.ID : null;
+  }
+  // never empty: SFMC stores "" as NULL, which the DE rejects
+  return parts.length ? parts.join(" / ") : "(folder " + id + " not found)";
+}
+
+function val(v, fallback) {
+  return v === null || v === undefined || String(v) === "" ? fallback : v;
+}
+
+function row(de, now) {
+  return {
+    CustomerKey: TARGET,
+    Properties: [
+      { Name: "Name", Value: val(de.Name, "(no name)") },
+      { Name: "CustomerKey", Value: de.CustomerKey },
+      { Name: "FolderPath", Value: pathOf(de.CategoryID) },
+      { Name: "IsSendable", Value: val(de.IsSendable, false) },
+      { Name: "CreatedDate", Value: val(de.CreatedDate, now) },
+      { Name: "ModifiedDate", Value: val(de.ModifiedDate, val(de.CreatedDate, now)) },
+      { Name: "LastRefreshed", Value: now }
+    ]
+  };
+}
+
+var folders = folderType("dataextension").concat(folderType("shared_dataextension"));
+for (var f = 0; f < folders.length; f++) byId[folders[f].ID] = folders[f];
+if (!folders.length) throw new Error("No DE folders returned; leaving target untouched.");
+
+var des = retrieveAll("DataExtension", ["Name", "CustomerKey", "CategoryID", "IsSendable", "CreatedDate", "ModifiedDate"], null);
+if (!des.length) throw new Error("No data extensions returned; leaving target untouched.");
+
+var cleared = api.performItem("DataExtension", { CustomerKey: TARGET }, "ClearData");
+if (cleared.Status != "OK") throw new Error("ClearData failed: " + Stringify(cleared).substring(0, 500));
+
+var now = Platform.Function.SystemDateToLocalDate(Platform.Function.Now());
+var inserted = 0, failed = 0, firstError = "";
+var batch = [];
+
+for (var d = 0; d < des.length; d++) {
+  batch.push(row(des[d], now));
+  if (batch.length == BATCH || d == des.length - 1) {
+    var res = api.createBatch("DataExtensionObject", batch);
+    for (var r = 0; r < res.Results.length; r++) {
+      if (res.Results[r].StatusCode == "OK") inserted++;
+      else {
+        failed++;
+        if (!firstError) firstError = res.Results[r].ErrorMessage;
+      }
+    }
+    batch = [];
+  }
+}
+
+if (failed) throw new Error(inserted + " inserted, " + failed + " failed. First error: " + firstError);
+</script>
